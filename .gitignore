@@ -1,0 +1,45 @@
+PyFstat_example_data
+__pychache__
+*.pyc
+test_BNU
+gmm_dataset.pth
+
+LAL_example_data/SFTs_*
+mismatch_output/
+lalpulsar_Makefakedata_v5-help
+# Ignore all csv files in the data directory except for x.csv and y.csv
+data/*.csv
+!data/x_data.csv
+!data/y_data.csv
+
+
+best_flow.pt
+trained_flow.pt
+logs/run_20250616_101802/checkpoints/fold_1_model.pt
+data/mismatches.pth
+
+logs/run_*/checkpoints/
+# Ignore all checkpoints in logs
+logs/run_*/predictions/
+logs/run_*/merged_predictions.csv
+
+logs/profiled_run_*/checkpoints/
+# Ignore all checkpoints in logs
+logs/profiled_run_*/predictions/
+logs/profiled_run_*/merged_predictions.csv
+logs/bottleneck_analysis_20250616_194457/trained_model.pt
+.DS_Store
+default.profraw
+*.sft
+*.dat
+
+LAL_example_data/LALSemiCoherentF0F1F2_corrected/**/*.sh
+LAL_example_data/LALSemiCoherentF0F1F2_corrected/**/*.dat
+
+LAL_example_data/LALSemiCoherentF0F1F2_corrected0/*.sh
+LAL_example_data/LALSemiCoherentF0F1F2_corrected0/*.dat
+
+
+
+LAL_example_data/LALSemiCoherentF0F1F2_search/**/*.sh
+LAL_example_data/LALSemiCoherentF0F1F2_search/**/*.dat
