@@ -1,1 +1,5 @@
 python train_nfs_mismatch\ copy.py --num_bins 10 --hidden_features 16 --lr 5e-3 --epochs 50
+
+
+
+python train_nfs_mismatch_search.py --grid_search --lr_values 5e-3 --hidden_features_values 8 16 32 --num_layers_values 2 4 6 --num_bins_values 10 20 30 --epochs 50

@@ -389,6 +389,10 @@ def run_grid_search(
                 'primary_score': float('inf')
             }
             results.append(error_result)
+            
+        finally:
+            del flow
+            torch.cuda.empty_cache()
     
     return best_config, results
 
