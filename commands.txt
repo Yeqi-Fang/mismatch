@@ -3,3 +3,11 @@ python train_nfs_mismatch\ copy.py --num_bins 10 --hidden_features 16 --lr 5e-3 
 
 
 python train_nfs_mismatch_search.py --grid_search --lr_values 5e-3 --hidden_features_values 8 16 32 --num_layers_values 2 4 6 --num_bins_values 10 20 30 --epochs 50
+
+
+python train_nfs_mismatch_search.py --grid_search --lr_values 7e-3 --hidden_features_values 6 8 10 --num_layers_values 2 3 --num_bins_values 8 10  --epochs 50
+
+
+python train_nfs_mismatch_search.py --grid_search --lr_values 7e-3 --hidden_features_values 4 5 6 --num_layers_values 1 2 3 --num_bins_values 6 8  --epochs 50
+
+train_nfs_mismatch2.py --lr 7e-3 --x_csv ~/aei/data/x_data_filtered2.csv --y_csv ~/aei/data/y_data_filtered2.csv --epochs 50 --hidden_features 16 --num_layers 3 --num_bins 15 --test_ratio 0.1
