@@ -1,0 +1,8 @@
+{
+  "training_completed": true,
+  "log_directory": "logs/20250701_093911",
+  "final_train_loss": 10.532685121596838,
+  "final_test_loss": 13.131717710141782,
+  "mean_setup_error": 27.437278747558594,
+  "std_setup_error": 70.592041015625
+}

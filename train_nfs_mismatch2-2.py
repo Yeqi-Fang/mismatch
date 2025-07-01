@@ -14,7 +14,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, random_split
 import matplotlib.pyplot as plt
 import seaborn as sns
-
+from nflows.transforms.normalization import BatchNorm
+from nflows.transforms.permutations import RandomPermutation
 from nflows.distributions.normal import StandardNormal
 from nflows.flows.base import Flow
 from nflows.transforms.base import CompositeTransform
@@ -75,32 +76,41 @@ def load_dataset(x_path: Path | str, y_path: Path | str) -> Tuple[torch.Tensor, 
     return x_tensor, y_tensor
 
 
-def build_nfs_model(context_features: int, flow_features: int = 1, 
-                   hidden_features: int = 16, num_layers: int = 3, 
-                   num_bins: int = 15) -> Tuple[Flow, dict]:
-    transforms = []
-    for k in range(num_layers):
-        # Rational–quadratic spline, conditional on context
-        transforms.append(
-            MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
-                features=1,
-                hidden_features=hidden_features,
-                context_features=context_features,
-                num_bins=num_bins,
-                tails="linear",
-                tail_bound=4.0,
-            )
-        )
-        # Simple affine layer as a 'residual'
-        transforms.append(
-            MaskedAffineAutoregressiveTransform(
-                features=1,
-                hidden_features=hidden_features,
-                context_features=context_features,
-            )
-        )
+def _init_identity(transform):
+    # assume transform has an internal autoregressive net
+    for module in transform.autoregressive_net.modules():
+        if isinstance(module, torch.nn.Linear):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.xavier_uniform_(module.weight)
 
-    base_dist = StandardNormal([1])
+def build_nfs_model(context_features, flow_features=1, hidden_features=16,
+                    num_layers=3, num_bins=15):
+    transforms = []
+    for _ in range(num_layers):
+        # spline block
+        spline = MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
+            features=flow_features,
+            hidden_features=hidden_features,
+            context_features=context_features,
+            num_bins=num_bins,
+            tails="linear",
+            tail_bound=4.0,
+        )
+        _init_identity(spline)
+        transforms.append(spline)
+        transforms.append(BatchNorm(features=flow_features))
+
+        # affine block
+        affine = MaskedAffineAutoregressiveTransform(
+            features=flow_features,
+            hidden_features=hidden_features,
+            context_features=context_features,
+        )
+        _init_identity(affine)
+        transforms.append(affine)
+        transforms.append(RandomPermutation(features=flow_features))
+
+    base_dist = StandardNormal([flow_features])
     flow = Flow(CompositeTransform(transforms), base_dist).float()
     
     # Return model config for metadata

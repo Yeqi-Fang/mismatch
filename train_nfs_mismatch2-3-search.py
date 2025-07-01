@@ -14,7 +14,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, random_split
 import matplotlib.pyplot as plt
 import seaborn as sns
-
+from nflows.transforms.normalization import BatchNorm
+from nflows.transforms.permutations import RandomPermutation
 from nflows.distributions.normal import StandardNormal
 from nflows.flows.base import Flow
 from nflows.transforms.base import CompositeTransform
@@ -23,6 +24,12 @@ from nflows.transforms.autoregressive import (
     MaskedPiecewiseRationalQuadraticAutoregressiveTransform
 )
 from nflows.transforms.permutations import RandomPermutation
+from nflows.distributions.mixture import MADEMoG
+from nflows.distributions.normal import StandardNormal
+from nflows.flows.base import Flow
+from nflows.transforms.base import CompositeTransform
+from torch.distributions import Categorical
+
 from datetime import datetime
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 log_dir = f"logs/{timestamp}"
@@ -75,32 +82,47 @@ def load_dataset(x_path: Path | str, y_path: Path | str) -> Tuple[torch.Tensor, 
     return x_tensor, y_tensor
 
 
-def build_nfs_model(context_features: int, flow_features: int = 1, 
-                   hidden_features: int = 16, num_layers: int = 3, 
-                   num_bins: int = 15) -> Tuple[Flow, dict]:
-    transforms = []
-    for k in range(num_layers):
-        # Rational–quadratic spline, conditional on context
-        transforms.append(
-            MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
-                features=1,
-                hidden_features=hidden_features,
-                context_features=context_features,
-                num_bins=num_bins,
-                tails="linear",
-                tail_bound=4.0,
-            )
-        )
-        # Simple affine layer as a 'residual'
-        transforms.append(
-            MaskedAffineAutoregressiveTransform(
-                features=1,
-                hidden_features=hidden_features,
-                context_features=context_features,
-            )
-        )
+def _init_identity(transform):
+    # assume transform has an internal autoregressive net
+    for module in transform.autoregressive_net.modules():
+        if isinstance(module, torch.nn.Linear):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.xavier_uniform_(module.weight)
 
-    base_dist = StandardNormal([1])
+def build_nfs_model(context_features, flow_features=1, hidden_features=16,
+                    num_layers=3, num_bins=15, num_mixture_components: int = 3):
+    transforms = []
+    for _ in range(num_layers):
+        # spline block
+        spline = MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
+            features=flow_features,
+            hidden_features=hidden_features,
+            context_features=context_features,
+            num_bins=num_bins,
+            tails="linear",
+            tail_bound=4.0,
+        )
+        _init_identity(spline)
+        transforms.append(spline)
+        transforms.append(BatchNorm(features=flow_features))
+
+        # affine block
+        affine = MaskedAffineAutoregressiveTransform(
+            features=flow_features,
+            hidden_features=hidden_features,
+            context_features=context_features,
+        )
+        _init_identity(affine)
+        transforms.append(affine)
+        transforms.append(RandomPermutation(features=flow_features))
+
+    base_dist = MADEMoG(
+        features=flow_features,
+        hidden_features=hidden_features,
+        context_features=context_features,
+        num_mixture_components=num_mixture_components,
+    )
+    
     flow = Flow(CompositeTransform(transforms), base_dist).float()
     
     # Return model config for metadata
@@ -115,7 +137,7 @@ def build_nfs_model(context_features: int, flow_features: int = 1,
         "total_parameters": sum(p.numel() for p in flow.parameters())
     }
     
-    return flow, model_config
+    return flow, { **model_config, "num_mixture_components": num_mixture_components }
 
 def train(model: Flow, train_loader: DataLoader, test_loader: DataLoader = None, 
           *, epochs: int = 200, lr: float = 5e-3) -> dict:
@@ -218,7 +240,8 @@ def evaluate(
 ) -> torch.Tensor:
     """Enhanced evaluation with more metrics."""
     model.eval()
-
+    eval_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(eval_device)
     # 从测试集中选择4个不同的setup进行可视化
     test_setup_cols = x_test[:, :3]  # 前3列是setup特征
     test_unique_setups, test_indices = torch.unique(test_setup_cols, dim=0, return_inverse=True)
@@ -246,12 +269,28 @@ def evaluate(
         
         with torch.no_grad():
             for start in range(0, len(x_setup), batch_size):
-                cx = x_setup[start : start + batch_size].to(device)
+                cx = x_setup[start : start + batch_size].to(eval_device)
                 y = y_setup[start : start + batch_size]
                 
                 try:
-                    batch_samples = model.sample(samples_per_cond, context=cx).cpu()
-                    batch_log_probs = model.log_prob(inputs=y.to(device), context=cx).cpu()
+                    # ---- GPU‐only sampling ----
+                    B = cx.size(0)
+                    # draw noise on GPU
+                    z = torch.randn(samples_per_cond, B, 1, device=eval_device)
+                    # flatten so we can call inverse
+                    z_flat = z.view(-1, 1)
+                    # replicate context
+                    ctx_rep = cx.unsqueeze(0).expand(samples_per_cond, -1, -1) \
+                                 .reshape(-1, cx.size(-1))
+                    # inverse‐transform back to data‐space
+                    x_flat, _ = model._transform.inverse(z_flat, context=ctx_rep)
+                    batch_samples = x_flat.view(samples_per_cond, B, -1).cpu()
+
+                    # log_probs as before (this one is safe: we .to(eval_device) first)
+                    batch_log_probs = model.log_prob(
+                        inputs=y.to(eval_device),
+                        context=cx
+                    ).cpu()
                     
                     generated.append(batch_samples)
                     empirical.append(y.repeat(samples_per_cond, 1))
@@ -300,7 +339,8 @@ def evaluate(
 
     # ✅ 计算所有测试集setup的平均误差
     print(f"\n📊 Computing errors for all {len(test_unique_setups)} test setups...")
-    
+    model.to(device)  # ← ADD THIS LINE TOO
+
     all_setup_errors = []
     setup_error_details = []
     
@@ -319,12 +359,25 @@ def evaluate(
         generated_samples = []
         with torch.no_grad():
             for start in range(0, len(x_setup), batch_size):
-                cx = x_setup[start : start + batch_size].to(device)
-                batch_samples = model.sample(samples_per_cond, context=cx).cpu()
+                # cx = x_setup[start : start + batch_size].to(eval_device)
+                # batch_samples = model.sample(samples_per_cond, context=cx).cpu()
+                cx = x_setup[start : start + batch_size].to(eval_device)
+                # same GPU‐sampling hack as above
+                B = cx.size(0)
+                z = torch.randn(samples_per_cond, B, 1, device=eval_device)
+                z_flat = z.view(-1, 1)
+                ctx_rep = cx.unsqueeze(0).expand(samples_per_cond, -1, -1) \
+                             .reshape(-1, cx.size(-1))
+                x_flat, _ = model._transform.inverse(z_flat, context=ctx_rep)
+                batch_samples = x_flat.view(samples_per_cond, B, -1).cpu()                
+                
                 generated_samples.append(batch_samples)
         
         if generated_samples:
-            all_generated = torch.cat(generated_samples)
+            # first flatten each [samples_per_cond, B, 1] → [samples_per_cond * B]
+            flattened = [b.reshape(-1) for b in generated_samples]
+            # now concatenate end-to-end
+            all_generated = torch.cat(flattened, dim=0)
             pred_setup_mean = all_generated.mean().item()
             
             # 计算相对误差

@@ -14,7 +14,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, random_split
 import matplotlib.pyplot as plt
 import seaborn as sns
+import torch.nn as nn
 
+from nflows.distributions.base import Distribution
 from nflows.distributions.normal import StandardNormal
 from nflows.flows.base import Flow
 from nflows.transforms.base import CompositeTransform
@@ -23,6 +25,12 @@ from nflows.transforms.autoregressive import (
     MaskedPiecewiseRationalQuadraticAutoregressiveTransform
 )
 from nflows.transforms.permutations import RandomPermutation
+from nflows.transforms.coupling import (
+    PiecewiseRationalQuadraticCouplingTransform,
+    AffineCouplingTransform
+)
+from nflows.transforms.normalization import BatchNorm
+from torch.distributions import Beta
 from datetime import datetime
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 log_dir = f"logs/{timestamp}"
@@ -75,112 +83,170 @@ def load_dataset(x_path: Path | str, y_path: Path | str) -> Tuple[torch.Tensor, 
     return x_tensor, y_tensor
 
 
-def build_nfs_model(context_features: int, flow_features: int = 1, 
-                   hidden_features: int = 16, num_layers: int = 3, 
-                   num_bins: int = 15) -> Tuple[Flow, dict]:
-    transforms = []
-    for k in range(num_layers):
-        # Rational–quadratic spline, conditional on context
-        transforms.append(
-            MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
-                features=1,
-                hidden_features=hidden_features,
-                context_features=context_features,
-                num_bins=num_bins,
-                tails="linear",
-                tail_bound=4.0,
-            )
-        )
-        # Simple affine layer as a 'residual'
-        transforms.append(
-            MaskedAffineAutoregressiveTransform(
-                features=1,
-                hidden_features=hidden_features,
-                context_features=context_features,
-            )
-        )
-
-    base_dist = StandardNormal([1])
-    flow = Flow(CompositeTransform(transforms), base_dist).float()
+class BetaDistribution(Distribution):
+    """Beta base distribution for [0,1] support"""
     
-    # Return model config for metadata
-    model_config = {
-        "model_type": "MaskedPiecewiseRationalQuadraticAutoregressiveTransform",
-        "context_features": context_features,
-        "flow_features": flow_features,
-        "hidden_features": hidden_features,
-        "num_layers": num_layers,
-        "num_bins": num_bins,
-        "base_distribution": "StandardNormal",
-        "total_parameters": sum(p.numel() for p in flow.parameters())
-    }
+    def __init__(self, shape, alpha=1.0, beta=1.0):
+        super().__init__()
+        self._shape = torch.Size(shape)
+        self.register_buffer('alpha', torch.tensor(alpha))
+        self.register_buffer('beta', torch.tensor(beta))
+        self._beta_dist = Beta(self.alpha, self.beta)
     
-    return flow, model_config
+    def _log_prob(self, inputs, context):
+        return self._beta_dist.log_prob(inputs).sum(-1)
+    
+    def _sample(self, num_samples, context):
+        return self._beta_dist.sample((num_samples,) + self._shape)
 
-def train(model: Flow, train_loader: DataLoader, test_loader: DataLoader = None, 
-          *, epochs: int = 200, lr: float = 5e-3) -> dict:
-    """Single‑loop optimiser with test loss tracking and training plots."""
+
+
+# Fix 1: More aggressive gradient clipping and better training
+def train_flow_stable_fixed(model, train_loader, test_loader=None, epochs=200, lr=5e-3):
+    """Training with much more aggressive stability measures"""
     model.to(device)
-    opt = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     
-    # Track losses
+    # Ensure all components are on device
+    for param in model.parameters():
+        param.data = param.data.to(device)
+    for buffer in model.buffers():
+        buffer.data = buffer.data.to(device)
+    
+    # Lower learning rate and more aggressive weight decay
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.7, min_lr=1e-6)
+    
     train_losses = []
     test_losses = []
     
-    print(f"🚀 Starting training for {epochs} epochs...")
+    print(f"🚀 Starting stable training for {epochs} epochs...")
     
-    for epoch in range(1, epochs + 1):
-        # Training phase
+    for epoch in range(epochs + 1):
         model.train()
-        ep_train_loss = 0.0
-        for cx, y in train_loader:
-            cx, y = cx.to(device), y.to(device)
-            opt.zero_grad(set_to_none=True)
-            loss = -model.log_prob(inputs=y, context=cx).mean()
-            loss.backward()
-            opt.step()
-            ep_train_loss += loss.item()
-        ep_train_loss /= len(train_loader)
-        train_losses.append(ep_train_loss)
+        epoch_loss = 0.0
+        valid_batches = 0
         
-        # Test phase (if test_loader provided)
-        ep_test_loss = None
-        if test_loader is not None:
+        for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            
+            # More aggressive clamping
+            batch_y = torch.clamp(batch_y, 1e-5, 1-1e-5)
+            
+            optimizer.zero_grad()
+            
+            try:
+                log_prob = model.log_prob(inputs=batch_y, context=batch_x)
+                loss = -log_prob.mean()
+                
+                # Check for problematic losses
+                if torch.isnan(loss) or torch.isinf(loss) or loss > 1000:
+                    print(f"⚠️ Problematic loss {loss:.2f} at epoch {epoch}, batch {batch_idx}, skipping")
+                    continue
+                
+                loss.backward()
+                
+                # Much more aggressive gradient clipping
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                
+                # Check for gradient explosion
+                if grad_norm > 10.0:
+                    print(f"⚠️ Large gradient norm {grad_norm:.2f} at epoch {epoch}, skipping step")
+                    continue
+                
+                optimizer.step()
+                epoch_loss += loss.item()
+                valid_batches += 1
+                
+            except RuntimeError as e:
+                print(f"Runtime error at epoch {epoch}, batch {batch_idx}: {e}")
+                continue
+        
+        if valid_batches > 0:
+            epoch_loss /= valid_batches
+        else:
+            print(f"⚠️ No valid batches in epoch {epoch}")
+            epoch_loss = float('inf')
+        
+        train_losses.append(epoch_loss)
+        
+        # Validation with early stopping check
+        if test_loader:
             model.eval()
-            ep_test_loss = 0.0
+            test_loss = 0.0
+            test_valid_batches = 0
             with torch.no_grad():
-                for cx, y in test_loader:
-                    cx, y = cx.to(device), y.to(device)
-                    loss = -model.log_prob(inputs=y, context=cx).mean()
-                    ep_test_loss += loss.item()
-                ep_test_loss /= len(test_loader)
-                test_losses.append(ep_test_loss)
-
-        # Logging
-        if epoch % 5 == 0 or epoch == 1 or epoch == epochs:
-            log_msg = f"Epoch {epoch:3d}/{epochs} | train nll {ep_train_loss:.4f}"
-            if ep_test_loss is not None:
-                log_msg += f" | test nll {ep_test_loss:.4f}"
+                for batch_x, batch_y in test_loader:
+                    batch_x = batch_x.to(device)
+                    batch_y = batch_y.to(device)
+                    batch_y = torch.clamp(batch_y, 1e-5, 1-1e-5)
+                    
+                    try:
+                        log_prob = model.log_prob(inputs=batch_y, context=batch_x)
+                        batch_test_loss = -log_prob.mean().item()
+                        
+                        # Skip problematic test losses
+                        if not (torch.isnan(torch.tensor(batch_test_loss)) or torch.isinf(torch.tensor(batch_test_loss))):
+                            test_loss += batch_test_loss
+                            test_valid_batches += 1
+                    except Exception as e:
+                        continue
+            
+            if test_valid_batches > 0:
+                test_loss /= test_valid_batches
+                test_losses.append(test_loss)
+                scheduler.step(test_loss)
+            else:
+                test_losses.append(float('inf'))
+        
+        # Early stopping if training becomes unstable
+        if epoch_loss > 1000:
+            print(f"🛑 Training unstable (loss > 1000), stopping early at epoch {epoch}")
+            break
+        
+        # Logging with stability warnings
+        if epoch % 10 == 0 or epoch == 1:
+            log_msg = f"Epoch {epoch:3d}/{epochs} | train nll {epoch_loss:.4f}"
+            if test_loader and test_losses:
+                log_msg += f" | test nll {test_losses[-1]:.4f}"
             print(log_msg)
-
+            
+            # Warn about instability
+            if epoch_loss > 100:
+                print(f"⚠️ Training loss is high ({epoch_loss:.2f}) - potential instability")
+    
     # Save model
     torch.save(model.state_dict(), os.path.join(log_dir, "trained_flow.pt"))
     print(f"✔️  Training complete – model saved to {log_dir}/trained_flow.pt")
     
-    # Create and save training plot
-    plt.figure(figsize=(10, 6))
-    epochs_range = range(1, epochs + 1)
+    # Create training plot
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    epochs_range = range(1, len(train_losses) + 1)
     plt.plot(epochs_range, train_losses, 'b-', label='Training Loss', linewidth=2)
     if test_losses:
-        plt.plot(epochs_range, test_losses, 'r-', label='Test Loss', linewidth=2)
-    
+        plt.plot(epochs_range, test_losses[:len(train_losses)], 'r-', label='Test Loss', linewidth=2)
     plt.xlabel('Epoch')
     plt.ylabel('Negative Log-Likelihood')
-    plt.title('Training and Test Loss Over Time')
+    plt.title('Training Curves')
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.tight_layout()
     
+    # Log scale plot to see the explosion better
+    plt.subplot(1, 2, 2)
+    plt.semilogy(epochs_range, train_losses, 'b-', label='Training Loss (log scale)', linewidth=2)
+    if test_losses:
+        # Only plot positive test losses on log scale
+        positive_test_losses = [max(1e-10, loss) for loss in test_losses[:len(train_losses)]]
+        plt.semilogy(epochs_range, positive_test_losses, 'r-', label='Test Loss (log scale)', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('Negative Log-Likelihood (log scale)')
+    plt.title('Training Curves (Log Scale)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
     plot_path = os.path.join(log_dir, "training_curves.pdf")
     plt.savefig(plot_path, bbox_inches='tight', dpi=300)
     plt.show()
@@ -190,20 +256,167 @@ def train(model: Flow, train_loader: DataLoader, test_loader: DataLoader = None,
     loss_data = {
         'epoch': list(epochs_range),
         'train_loss': train_losses,
-        'test_loss': test_losses if test_losses else [None] * epochs
+        'test_loss': test_losses[:len(train_losses)] if test_losses else [None] * len(train_losses)
     }
     loss_df = pd.DataFrame(loss_data)
     loss_csv_path = os.path.join(log_dir, "training_losses.csv")
     loss_df.to_csv(loss_csv_path, index=False)
     print(f"✔️  Loss data saved to {loss_csv_path}")
     
-    return {
-        'train_losses': train_losses,
-        'test_losses': test_losses,
-        'final_train_loss': train_losses[-1],
-        'final_test_loss': test_losses[-1] if test_losses else None
-    }
+    return train_losses, test_losses
 
+# Fix 2: More conservative model architecture
+def build_conservative_flow(context_features: int, hidden_features: int = 32, 
+                           num_layers: int = 4, num_bins: int = 8):
+    """More conservative flow architecture for stability"""
+    transforms = []
+    
+    for i in range(num_layers):
+        if i % 2 == 0:
+            # Smaller tail bounds and fewer bins for stability
+            transforms.append(
+                MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
+                    features=1,
+                    hidden_features=hidden_features,
+                    context_features=context_features,
+                    num_bins=num_bins,
+                    tails="linear",
+                    tail_bound=2.0,  # Reduced from 4.0
+                )
+            )
+        else:
+            transforms.append(
+                MaskedAffineAutoregressiveTransform(
+                    features=1,
+                    hidden_features=hidden_features,
+                    context_features=context_features,
+                )
+            )
+    
+    base_dist = StandardNormal([1])
+    flow = Flow(CompositeTransform(transforms), base_dist)
+    
+    # Move to device
+    if torch.cuda.is_available():
+        flow = flow.to(device)
+        for param in flow.parameters():
+            param.data = param.data.to(device)
+        for buffer in flow.buffers():
+            buffer.data = buffer.data.to(device)
+    
+    return flow
+
+# Update build_nfs_model for stability
+def build_nfs_model_stable(context_features: int, flow_features: int = 1, 
+                          hidden_features: int = 16, num_layers: int = 3, 
+                          num_bins: int = 15) -> Tuple[Flow, dict]:
+    """Build more stable flow model"""
+    
+    # Use more conservative architecture
+    flow = build_conservative_flow(
+        context_features=context_features,
+        hidden_features=hidden_features * 2,  # Reduced from 4x
+        num_layers=num_layers,  # Don't double the layers
+        num_bins=max(8, num_bins // 2)  # Fewer bins for stability
+    )
+    
+    model_config = {
+        "model_type": "ConservativeAutoregressiveFlow",
+        "context_features": context_features,
+        "hidden_features": hidden_features * 2,
+        "num_layers": num_layers,
+        "num_bins": max(8, num_bins // 2),
+        "base_distribution": "StandardNormal",
+        "stability_measures": "conservative_architecture_aggressive_clipping",
+        "total_parameters": sum(p.numel() for p in flow.parameters())
+    }
+    
+    return flow, model_config
+
+
+
+def build_autoregressive_flow_for_01(context_features: int, hidden_features: int = 64,
+                                   num_layers: int = 8, num_bins: int = 32):
+    """
+    Improved autoregressive flow for [0,1] data with Normal base distribution
+    """
+    transforms = []
+    
+    for i in range(num_layers):
+        if i % 3 == 0:
+            # Rational quadratic spline
+            transforms.append(
+                MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
+                    features=1,
+                    hidden_features=hidden_features,
+                    context_features=context_features,
+                    num_bins=num_bins,
+                    tails="linear",
+                    tail_bound=4.0,
+                )
+            )
+        elif i % 3 == 1:
+            # Affine transform
+            transforms.append(
+                MaskedAffineAutoregressiveTransform(
+                    features=1,
+                    hidden_features=hidden_features,
+                    context_features=context_features,
+                )
+            )
+        else:
+            # Add random permutation for better mixing
+            transforms.append(RandomPermutation(features=1))
+    
+    # Use Standard Normal base distribution (safer for flows)
+    base_dist = StandardNormal([1])
+    flow = Flow(CompositeTransform(transforms), base_dist)
+    
+    return flow
+
+
+# Better option: Use logit transformation for proper [0,1] handling
+def build_logit_flow_for_01(context_features: int, hidden_features: int = 64, 
+                           num_layers: int = 8, num_bins: int = 32):
+    """
+    Flow with logit transformation - maps [0,1] to (-∞,∞) properly
+    This is the RECOMMENDED approach for [0,1] bounded data
+    """
+    from nflows.transforms.nonlinearities import Sigmoid
+    
+    transforms = []
+    
+    # First apply logit transformation to map [0,1] to (-∞,∞)
+    # This handles the boundary constraints properly
+    transforms.append(Sigmoid())
+    
+    # Then apply normalizing flows in unbounded space
+    for i in range(num_layers):
+        if i % 2 == 0:
+            transforms.append(
+                MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
+                    features=1,
+                    hidden_features=hidden_features,
+                    context_features=context_features,
+                    num_bins=num_bins,
+                    tails="linear",
+                    tail_bound=5.0,
+                )
+            )
+        else:
+            transforms.append(
+                MaskedAffineAutoregressiveTransform(
+                    features=1,
+                    hidden_features=hidden_features,
+                    context_features=context_features,
+                )
+            )
+    
+    # Use standard normal base distribution
+    base_dist = StandardNormal([1])
+    flow = Flow(CompositeTransform(transforms), base_dist)
+    
+    return flow
 
 def evaluate(
     model: Flow,
@@ -376,6 +589,7 @@ def main() -> None:
     parser.add_argument("--test_ratio", type=float, default=0.2, help="Fraction of data held out for testing")
     parser.add_argument("--samples_per_cond", type=int, default=100, help="Samples per test condition during evaluation")
     parser.add_argument("--eval_subset", type=int, default=10000, help="Random subset of test rows to evaluate (None = all)")
+    parser.add_argument("--batch_size", type=int, default=1024, help="Batch size for training")
     args = parser.parse_args()
 
     # ——— Load + split ———
@@ -412,14 +626,14 @@ def main() -> None:
     print(f"Split by setup → train: {len(train_ds)} samples ({len(train_setup_indices)} setups) | test: {len(test_ds)} samples ({len(test_setup_indices)} setups)")
     
     # ——— DataLoaders ———
-    batch_size = min(1024, len(train_ds))
-    test_batch_size = min(512, len(test_ds))
+    batch_size = args.batch_size
+    test_batch_size = batch_size
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_ds, batch_size=test_batch_size, shuffle=False)
 
     # ——— Model + Save metadata ———
-    flow, model_config = build_nfs_model(
+    flow, model_config = build_nfs_model_stable(
         context_features=x.shape[1],
         hidden_features=args.hidden_features,
         num_layers=args.num_layers,
@@ -458,7 +672,7 @@ def main() -> None:
     save_metadata(log_dir, model_config, training_config, data_config)
     
     # ——— Training ———
-    training_results = train(
+    training_results = train_flow_stable_fixed(
         flow, 
         train_loader, 
         test_loader,
@@ -494,8 +708,8 @@ def main() -> None:
     final_summary = {
         "training_completed": True,
         "log_directory": log_dir,
-        "final_train_loss": training_results['final_train_loss'],
-        "final_test_loss": training_results['final_test_loss'],
+        "final_train_loss": training_results[0][-1] if training_results[0] else None,  # Last training loss
+        "final_test_loss": training_results[1][-1] if training_results[1] else None,   # Last test loss
         "mean_setup_error": float(all_errors.mean()) if len(all_errors) > 0 else None,
         "std_setup_error": float(all_errors.std()) if len(all_errors) > 0 else None
     }

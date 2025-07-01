@@ -1,0 +1,40 @@
+{
+  "timestamp": "2025-07-01T18:29:38.273582",
+  "device": "cuda",
+  "model_config": {
+    "model_type": "MaskedPiecewiseRationalQuadraticAutoregressiveTransform",
+    "context_features": 6,
+    "flow_features": 1,
+    "hidden_features": 16,
+    "num_layers": 3,
+    "num_bins": 15,
+    "base_distribution": "StandardNormal",
+    "total_parameters": 12697,
+    "num_mixture_components": 3
+  },
+  "training_config": {
+    "epochs": 1,
+    "learning_rate": 0.001,
+    "batch_size": 1024,
+    "test_batch_size": 512,
+    "optimizer": "Adam"
+  },
+  "data_config": {
+    "x_csv_path": "/home/fyq/aei/data/x_data_filtered2.csv",
+    "y_csv_path": "/home/fyq/aei/data/y_data_filtered2.csv",
+    "total_samples": 2076005,
+    "input_features": 6,
+    "output_features": 1,
+    "train_samples": 1869005,
+    "test_samples": 207000,
+    "train_setups": 3730,
+    "test_setups": 414,
+    "test_ratio": 0.1,
+    "y_data_stats": {
+      "min": 5.132046680955682e-06,
+      "max": 0.9849724173545837,
+      "mean": 0.250381737947464,
+      "std": 0.1970447301864624
+    }
+  }
+}
