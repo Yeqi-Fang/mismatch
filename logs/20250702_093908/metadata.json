@@ -1,0 +1,25 @@
+{
+  "timestamp": "2025-07-02T09:39:11.713181",
+  "device": "cuda",
+  "model_config": {
+    "model_type": "MaskedPiecewiseRationalQuadraticAutoregressiveTransform",
+    "context_features": 6,
+    "flow_features": 1,
+    "hidden_features": 16,
+    "num_layers": 2,
+    "num_bins": 8,
+    "base_distribution": "MADEMoG",
+    "total_parameters": 8287,
+    "num_mixture_components": 3
+  },
+  "training_config": {
+    "epochs": 1,
+    "learning_rate": 0.0003,
+    "batch_size": 1024
+  },
+  "data_config": {
+    "total_samples": 2076005,
+    "train_samples": 1869005,
+    "test_samples": 207000
+  }
+}
