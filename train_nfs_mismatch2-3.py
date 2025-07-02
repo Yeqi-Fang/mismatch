@@ -236,7 +236,7 @@ def evaluate(
     eval_subset: int | None = None,
     batch_size: int = 512,
     save_path: str = "images/evaluation.pdf",
-    error_csv_path: str = "errors/setup_errors.csv"
+    error_csv_path: str = "data/setup_errors.csv"
 ) -> torch.Tensor:
     """Enhanced evaluation with more metrics."""
     model.eval()

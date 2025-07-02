@@ -133,7 +133,7 @@ def build_nfs_model(context_features, flow_features=1, hidden_features=16,
         "hidden_features": hidden_features,
         "num_layers": num_layers,
         "num_bins": num_bins,
-        "base_distribution": "StandardNormal",
+        "base_distribution": "MADEMoG",
         "total_parameters": sum(p.numel() for p in flow.parameters())
     }
     
@@ -236,14 +236,14 @@ def evaluate(
     eval_subset: int | None = None,
     batch_size: int = 512,
     save_path: str = "images/evaluation.pdf",
-    error_csv_path: str = "errors/setup_errors.csv"
+    error_csv_path: str = "data/setup_errors.csv"
 ) -> torch.Tensor:
     """Enhanced evaluation with more metrics."""
     model.eval()
     eval_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(eval_device)
     # 从测试集中选择4个不同的setup进行可视化
-    test_setup_cols = x_test[:, :3]  # 前3列是setup特征
+    test_setup_cols = x_test[:, :6]  # 前3列是setup特征
     test_unique_setups, test_indices = torch.unique(test_setup_cols, dim=0, return_inverse=True)
     
     # 选择4个setup用于画图
@@ -272,32 +272,30 @@ def evaluate(
                 cx = x_setup[start : start + batch_size].to(eval_device)
                 y = y_setup[start : start + batch_size]
                 
-                try:
-                    # ---- GPU‐only sampling ----
-                    B = cx.size(0)
-                    # draw noise on GPU
-                    z = torch.randn(samples_per_cond, B, 1, device=eval_device)
-                    # flatten so we can call inverse
-                    z_flat = z.view(-1, 1)
-                    # replicate context
-                    ctx_rep = cx.unsqueeze(0).expand(samples_per_cond, -1, -1) \
-                                 .reshape(-1, cx.size(-1))
-                    # inverse‐transform back to data‐space
-                    x_flat, _ = model._transform.inverse(z_flat, context=ctx_rep)
-                    batch_samples = x_flat.view(samples_per_cond, B, -1).cpu()
+                # ---- GP we can call inverse
+                # z_flat = z.view(-1, 1)
+                # replicate context
+                # ctx_rep = cx.unsqueeze(0).expand(samples_per_cond, -1, -1) \
+                            # .reshape(-1, cx.size(-1))
+                # inverse‐transform back to data‐space
+                batch_samples = (
+                    model.sample(
+                        num_samples=samples_per_cond,
+                        context=cx                # shape [B, ctx_dim]
+                    )
+                    .cpu()                       # [samples_per_cond, B, 1]
+                )
 
-                    # log_probs as before (this one is safe: we .to(eval_device) first)
-                    batch_log_probs = model.log_prob(
-                        inputs=y.to(eval_device),
-                        context=cx
-                    ).cpu()
-                    
-                    generated.append(batch_samples)
-                    empirical.append(y.repeat(samples_per_cond, 1))
-                    log_probs.append(batch_log_probs)
-                except Exception as e:
-                    print(f"⚠️ Error in visualization batch: {e}")
-                    continue
+                # log_probs as before (this one is safe: we .to(eval_device) first)
+                batch_log_probs = model.log_prob(
+                    inputs=y.to(eval_device),
+                    context=cx
+                ).cpu()
+                
+                generated.append(batch_samples)
+                empirical.append(y.repeat(samples_per_cond, 1))
+                log_probs.append(batch_log_probs)
+
         
         if generated:
             y_emp = torch.cat(empirical).numpy().flatten()
@@ -363,14 +361,20 @@ def evaluate(
                 # batch_samples = model.sample(samples_per_cond, context=cx).cpu()
                 cx = x_setup[start : start + batch_size].to(eval_device)
                 # same GPU‐sampling hack as above
-                B = cx.size(0)
-                z = torch.randn(samples_per_cond, B, 1, device=eval_device)
-                z_flat = z.view(-1, 1)
-                ctx_rep = cx.unsqueeze(0).expand(samples_per_cond, -1, -1) \
-                             .reshape(-1, cx.size(-1))
-                x_flat, _ = model._transform.inverse(z_flat, context=ctx_rep)
-                batch_samples = x_flat.view(samples_per_cond, B, -1).cpu()                
-                
+                # B = cx.size(0)
+                # z = torch.randn(samples_per_cond, B, 1, device=eval_device)
+                # z_flat = z.view(-1, 1)
+                # ctx_rep = cx.unsqueeze(0).expand(samples_per_cond, -1, -1) \
+                #              .reshape(-1, cx.size(-1))
+                # x_flat, _ = model._transform.inverse(z_flat, context=ctx_rep)
+                # batch_samples = x_flat.view(samples_per_cond, B, -1).cpu()                
+                batch_samples = (
+                    model.sample(
+                        num_samples=samples_per_cond,
+                        context=cx                # shape [B, ctx_dim]
+                    )
+                    .cpu()                       # [samples_per_cond, B, 1]
+                )
                 generated_samples.append(batch_samples)
         
         if generated_samples:
@@ -422,141 +426,101 @@ def main() -> None:
     parser.add_argument("--x_csv", type=str, default="data/x_data.csv", help="Path to x CSV file")
     parser.add_argument("--y_csv", type=str, default="data/y_data.csv", help="Path to y CSV file")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=5e-3, help="Learning rate")
-    parser.add_argument("--hidden_features", type=int, default=16, help="Hidden features in each layer")
-    parser.add_argument("--num_layers", type=int, default=3, help="Number of flow layers")
-    parser.add_argument("--num_bins", type=int, default=15, help="Number of bins for spline transforms")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        nargs='+',
+        default=[5e-3],
+        help="Learning rate(s), e.g. --lr 1e-3 5e-3"
+    )
+    parser.add_argument(
+        "--hidden_features",
+        type=int,
+        nargs='+',
+        default=[16],
+        help="Hidden features in each layer, e.g. --hidden_features 16 32"
+    )
+    parser.add_argument(
+        "--num_layers",
+        type=int,
+        nargs='+',
+        default=[3],
+        help="Number of flow layers, e.g. --num_layers 2 3 4"
+    )
+    parser.add_argument(
+        "--num_bins",
+        type=int,
+        nargs='+',
+        default=[15],
+        help="Number of bins for spline transforms, e.g. --num_bins 8 15 32"
+    )
     parser.add_argument("--test_ratio", type=float, default=0.2, help="Fraction of data held out for testing")
     parser.add_argument("--samples_per_cond", type=int, default=100, help="Samples per test condition during evaluation")
     parser.add_argument("--eval_subset", type=int, default=10000, help="Random subset of test rows to evaluate (None = all)")
     args = parser.parse_args()
 
-    # ——— Load + split ———
-    x, y = load_dataset(args.x_csv, args.y_csv)
-    # set y all positive and set all elements < 0 to 0
-    y = torch.clamp(y, min=0.0)
-    print(f"Dataset loaded – {len(x)} rows, {x.shape[1]} features ➜ target dim 1")
-    print(f"Y data range: min={y.min():.4f}, max={y.max():.4f}")
-    print(f"Y data statistics: mean={y.mean():.4f}, std={y.std():.4f}")
-    
-    # 按setup分组划分（假设前6列是mf, mf1, mf2, gamma1, gamma2, T_coh）
-    setup_cols = x[:, :6]  # 提取setup列
-    unique_setups, indices = torch.unique(setup_cols, dim=0, return_inverse=True)
-    n_setups = len(unique_setups)
+    # prepare the grid of hyperparameters
+    from itertools import product
+    grid = list(product(args.lr, args.hidden_features, args.num_layers, args.num_bins))
+    results = []
 
-    # 按setup划分训练测试集
-    torch.manual_seed(42)
-    setup_perm = torch.randperm(n_setups)
-    n_test_setups = int(args.test_ratio * n_setups)
-    test_setup_indices = setup_perm[:n_test_setups]
-    train_setup_indices = setup_perm[n_test_setups:]
+    for lr, hf, nl, nb in grid:
+        print(f"\n🔧 Running with lr={lr}, hidden_features={hf}, num_layers={nl}, num_bins={nb}")
 
-    # 创建训练测试mask
-    test_mask = torch.isin(indices, test_setup_indices)
-    train_mask = ~test_mask
+        # ——— Load + split ———
+        x, y = load_dataset(args.x_csv, args.y_csv)
+        y = torch.clamp(y, min=0.0)
 
-    # 分割数据
-    x_train, y_train = x[train_mask], y[train_mask]
-    x_test, y_test = x[test_mask], y[test_mask]
+        # split by setup as before …
+        setup_cols = x[:, :6]
+        unique_setups, indices = torch.unique(setup_cols, dim=0, return_inverse=True)
+        n_setups = len(unique_setups)
+        torch.manual_seed(42)
+        perm = torch.randperm(n_setups)
+        n_test = int(args.test_ratio * n_setups)
+        test_idx = perm[:n_test]
+        mask = torch.isin(indices, test_idx)
+        x_train, y_train = x[~mask], y[~mask]
+        x_test,  y_test  = x[ mask], y[ mask]
 
-    train_ds = TensorDataset(x_train, y_train)
-    test_ds = TensorDataset(x_test, y_test)
+        # DataLoaders
+        batch_size      = min(1024, len(x_train))
+        test_batch_size = min(512, len(x_test))
+        train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size, shuffle=True)
+        test_loader  = DataLoader(TensorDataset(x_test,  y_test),  test_batch_size, shuffle=False)
 
-    print(f"Split by setup → train: {len(train_ds)} samples ({len(train_setup_indices)} setups) | test: {len(test_ds)} samples ({len(test_setup_indices)} setups)")
-    
-    # ——— DataLoaders ———
-    batch_size = min(1024, len(train_ds))
-    test_batch_size = min(512, len(test_ds))
+        # Build + metadata
+        flow, model_cfg = build_nfs_model(
+            context_features=x.shape[1],
+            hidden_features=hf,
+            num_layers=nl,
+            num_bins=nb
+        )
+        training_cfg = {"epochs": args.epochs, "learning_rate": lr, "batch_size": batch_size}
+        data_cfg = {"total_samples": len(x), "train_samples": len(x_train), "test_samples": len(x_test)}
+        save_metadata(log_dir, model_cfg, training_cfg, data_cfg)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=test_batch_size, shuffle=False)
+        # Train + evaluate
+        tr_res = train(flow, train_loader, test_loader, epochs=args.epochs, lr=lr)
+        flow.load_state_dict(torch.load(f"{log_dir}/trained_flow.pt", map_location=device))
+        errors = evaluate(flow, x_test, y_test, samples_per_cond=args.samples_per_cond)
 
-    # ——— Model + Save metadata ———
-    flow, model_config = build_nfs_model(
-        context_features=x.shape[1],
-        hidden_features=args.hidden_features,
-        num_layers=args.num_layers,
-        num_bins=args.num_bins
-    )
-    
-    # Prepare metadata
-    training_config = {
-        "epochs": args.epochs,
-        "learning_rate": args.lr,
-        "batch_size": batch_size,
-        "test_batch_size": test_batch_size,
-        "optimizer": "Adam"
-    }
-    
-    data_config = {
-        "x_csv_path": args.x_csv,
-        "y_csv_path": args.y_csv,
-        "total_samples": len(x),
-        "input_features": x.shape[1],
-        "output_features": y.shape[1],
-        "train_samples": len(train_ds),
-        "test_samples": len(test_ds),
-        "train_setups": len(train_setup_indices),
-        "test_setups": len(test_setup_indices),
-        "test_ratio": args.test_ratio,
-        "y_data_stats": {
-            "min": float(y.min()),
-            "max": float(y.max()),
-            "mean": float(y.mean()),
-            "std": float(y.std())
-        }
-    }
-    
-    # Save metadata
-    save_metadata(log_dir, model_config, training_config, data_config)
-    
-    # ——— Training ———
-    training_results = train(
-        flow, 
-        train_loader, 
-        test_loader,
-        epochs=args.epochs, 
-        lr=args.lr
-    )
-
-    # ——— Reload best weights & evaluate on all test setups ———
-    flow.load_state_dict(torch.load(os.path.join(log_dir, "trained_flow.pt"), map_location=device))
-
-    # 直接对整个测试集进行评估
-    print(f"\n🔍 Evaluating all test setups...")
-    
-    all_errors = evaluate(
-        flow,
-        x_test,
-        y_test,
-        samples_per_cond=args.samples_per_cond,
-        eval_subset=None if args.eval_subset <= 0 else args.eval_subset,
-        save_path=f"{log_dir}/evaluation_overview.pdf",
-        error_csv_path=f"{log_dir}/all_setup_errors.csv"
-    )
-    
-    # 保存最终统计
-    if len(all_errors) > 0:
-        overall_df = pd.DataFrame({
-            'setup_relative_errors': all_errors.numpy()
+        # record summary
+        results.append({
+            "lr": lr,
+            "hidden_features": hf,
+            "num_layers": nl,
+            "num_bins": nb,
+            "final_train_loss": tr_res["final_train_loss"],
+            "final_test_loss":  tr_res["final_test_loss"] or float('nan'),
+            "mean_setup_error":  float(errors.mean()) if len(errors)>0 else float('nan')
         })
-        overall_df.to_csv(f"{log_dir}/overall_error_summary.csv", index=False)
-        print(f"Final summary saved to: {log_dir}/overall_error_summary.csv")
-    
-    # Add training results to final summary
-    final_summary = {
-        "training_completed": True,
-        "log_directory": log_dir,
-        "final_train_loss": training_results['final_train_loss'],
-        "final_test_loss": training_results['final_test_loss'],
-        "mean_setup_error": float(all_errors.mean()) if len(all_errors) > 0 else None,
-        "std_setup_error": float(all_errors.std()) if len(all_errors) > 0 else None
-    }
-    
-    with open(os.path.join(log_dir, "final_summary.json"), 'w') as f:
-        json.dump(final_summary, f, indent=2)
-    
-    print(f"\n🎉 All results saved to: {log_dir}")
+
+    # write out the grid results
+    import pandas as pd
+    df = pd.DataFrame(results)
+    df.to_csv(f"{log_dir}/hyperparam_results.csv", index=False)
+    print(f"\n✅ Hyperparameter sweep complete — results in {log_dir}/hyperparam_results.csv")
 
 
 if __name__ == "__main__":

@@ -20,3 +20,7 @@ python train_nfs_mismatch2-2.py --lr 5e-3 --x_csv ~/aei/data/x_data_filtered2.cs
 
 
 python train_nfs_mismatch2-3.py --lr 5e-3 --x_csv ~/aei/data/x_data_filtered2.csv --y_csv ~/aei/data/y_data_filtered2.csv --epochs 50 --hidden_features 16 --num_layers 4 --num_bins 10 --test_ratio 0.1
+
+
+python train_nfs_mismatch2-3-search.py --lr 3e-4 1e-3 3e-3 --hidden_features 16 32 --num_layers 2 3 4 --num_bins 8 10 15 --x_csv ~/aei/data/x_data_filtered2.csv --y_csv ~/aei/data/y_data_filtered2.csv --epochs 50 --test_ratio 0.1
+
