@@ -3,20 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple
 import os
 import json
 import numpy as np
 import pandas as pd
 import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 import seaborn as sns
 from nflows.transforms.normalization import BatchNorm
-from nflows.transforms.permutations import RandomPermutation
-from nflows.distributions.normal import StandardNormal
 from nflows.flows.base import Flow
 from nflows.transforms.base import CompositeTransform
 from nflows.transforms.autoregressive import (
@@ -25,10 +23,7 @@ from nflows.transforms.autoregressive import (
 )
 from nflows.transforms.permutations import RandomPermutation
 from nflows.distributions.mixture import MADEMoG
-from nflows.distributions.normal import StandardNormal
-from nflows.flows.base import Flow
-from nflows.transforms.base import CompositeTransform
-from torch.distributions import Categorical
+from models import ContextEncoder
 
 from datetime import datetime
 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -47,8 +42,8 @@ os.makedirs(log_dir, exist_ok=True)
 #     device = torch.device("mps")
 if torch.cuda.is_available():
     device = torch.device("cuda")
-# else:
-# device = torch.device("cpu")
+else:
+    device = torch.device("cpu")
 
 print(f"Using device: {device}")
 
@@ -92,15 +87,17 @@ def _init_identity(transform):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.xavier_uniform_(module.weight)
 
-def build_nfs_model(context_features, flow_features=1, hidden_features=16,
-                    num_layers=3, num_bins=15, num_mixture_components: int = 3):
+def build_nfs_model(context_features, emb_dim: int = 32, flow_features=1, hidden_features=16,
+                    num_layers=3, num_bins=15, num_mixture_components: int = 3, dropout_probability=0.2):
+    
+    encoder = ContextEncoder(input_dim=context_features, emb_dim=emb_dim)
     transforms = []
     for _ in range(num_layers):
         # spline block
         spline = MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
             features=flow_features,
             hidden_features=hidden_features,
-            context_features=context_features,
+            context_features=emb_dim,
             num_bins=num_bins,
             tails="linear",
             tail_bound=4.0,
@@ -113,7 +110,7 @@ def build_nfs_model(context_features, flow_features=1, hidden_features=16,
         affine = MaskedAffineAutoregressiveTransform(
             features=flow_features,
             hidden_features=hidden_features,
-            context_features=context_features,
+            context_features=emb_dim,
         )
         _init_identity(affine)
         transforms.append(affine)
@@ -122,8 +119,9 @@ def build_nfs_model(context_features, flow_features=1, hidden_features=16,
     base_dist = MADEMoG(
         features=flow_features,
         hidden_features=hidden_features,
-        context_features=context_features,
+        context_features=emb_dim,
         num_mixture_components=num_mixture_components,
+        dropout_probability=dropout_probability
     )
     
     flow = Flow(CompositeTransform(transforms), base_dist).float()
@@ -137,17 +135,24 @@ def build_nfs_model(context_features, flow_features=1, hidden_features=16,
         "num_layers": num_layers,
         "num_bins": num_bins,
         "base_distribution": "MADEMoG",
-        "total_parameters": sum(p.numel() for p in flow.parameters())
+        "total_parameters": sum(p.numel() for p in flow.parameters()),
+        "emb_dim": emb_dim,
+        "dropout_probability": dropout_probability,
+        "encoder_type": "ContextEncoder",
     }
     
-    return flow, { **model_config, "num_mixture_components": num_mixture_components }
+    return encoder, flow, { **model_config, "num_mixture_components": num_mixture_components }
 
-def train(model: Flow, train_loader: DataLoader, test_loader: DataLoader = None, 
-          *, epochs: int = 200, lr: float = 5e-3) -> dict:
+def train(encoder: ContextEncoder, model: Flow, train_loader: DataLoader, test_loader: DataLoader = None, 
+          *, epochs: int = 200, lr: float = 5e-3, log_dir) -> dict:
     """Single‑loop optimiser with test loss tracking and training plots."""
+    encoder.to(device)
     model.to(device)
-    opt = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    
+    opt = torch.optim.Adam(
+        list(encoder.parameters()) + list(model.parameters()),
+        lr=lr,
+        weight_decay=1e-4
+    )
     # Track losses
     train_losses = []
     test_losses = []
@@ -161,7 +166,8 @@ def train(model: Flow, train_loader: DataLoader, test_loader: DataLoader = None,
         for cx, y in train_loader:
             cx, y = cx.to(device), y.to(device)
             opt.zero_grad(set_to_none=True)
-            loss = -model.log_prob(inputs=y, context=cx).mean()
+            ctx = encoder(cx)
+            loss = -model.log_prob(inputs=y, context=ctx).mean()
             loss.backward()
             opt.step()
             ep_train_loss += loss.item()
@@ -176,7 +182,8 @@ def train(model: Flow, train_loader: DataLoader, test_loader: DataLoader = None,
             with torch.no_grad():
                 for cx, y in test_loader:
                     cx, y = cx.to(device), y.to(device)
-                    loss = -model.log_prob(inputs=y, context=cx).mean()
+                    ctx = encoder(cx)
+                    loss = -model.log_prob(inputs=y, context=ctx).mean()
                     ep_test_loss += loss.item()
                 ep_test_loss /= len(test_loader)
                 test_losses.append(ep_test_loss)
@@ -208,7 +215,7 @@ def train(model: Flow, train_loader: DataLoader, test_loader: DataLoader = None,
     
     plot_path = os.path.join(log_dir, "training_curves.pdf")
     plt.savefig(plot_path, bbox_inches='tight', dpi=300)
-    plt.show()
+    # plt.show()
     print(f"✔️  Training plot saved to {plot_path}")
     
     # Save loss data
@@ -231,15 +238,14 @@ def train(model: Flow, train_loader: DataLoader, test_loader: DataLoader = None,
 
 
 def evaluate(
+    encoder: ContextEncoder,
     model: Flow,
     x_test: torch.Tensor,
     y_test: torch.Tensor,
     *,
     samples_per_cond: int = 100,
-    eval_subset: int | None = None,
     batch_size: int = 512,
-    save_path: str = "images/evaluation.pdf",
-    error_csv_path: str = "data/setup_errors.csv"
+    log_dir: str = "logs/evaluation"
 ) -> torch.Tensor:
     """Enhanced evaluation with more metrics."""
     model.eval()
@@ -252,6 +258,7 @@ def evaluate(
     # 选择4个setup用于画图
     n_viz_setups = min(4, len(test_unique_setups))
     selected_setups = torch.randperm(len(test_unique_setups))[:n_viz_setups]
+    cpu_flow = copy.deepcopy(model).to("cpu")
     
     # 对选中的4个setup画图
     for i, setup_idx in enumerate(selected_setups):
@@ -269,7 +276,7 @@ def evaluate(
         empirical = []
         generated = []
         log_probs = []
-        
+        # model_cpu = model.to("cpu")   # 2️⃣ temporarily move the flow
         with torch.no_grad():
             for start in range(0, len(x_setup), batch_size):
                 cx = x_setup[start : start + batch_size].to(eval_device)
@@ -282,22 +289,24 @@ def evaluate(
                             # .reshape(-1, cx.size(-1))
                 # inverse‐transform back to data‐space
                 # -------- device-safe CPU sampling --------
-                cx_cpu    = cx.cpu()          # 1️⃣ move context to CPU
-                model_cpu = model.to("cpu")   # 2️⃣ temporarily move the flow
-
+                # cx_cpu    = cx.cpu()          # 1️⃣ move context to CPU
+                ctx_gpu = encoder(cx)
+                ctx_cpu = ctx_gpu.detach().cpu()  # 3️⃣ encode context on CPU
+                # ctx_cpu = ctx.cpu()          # 1️⃣ move context to CPU
                 batch_samples = (
-                    model_cpu.sample(samples_per_cond, context=cx_cpu)  # 3️⃣ sample on CPU
+                    cpu_flow.sample(samples_per_cond, context=ctx_cpu)  # 3️⃣ sample on CPU
                             .to(eval_device)                           # 4️⃣ move result back
                 )
 
-                model.to(eval_device)         # 5️⃣ restore flow to GPU (for log_prob)
+                # model.to(eval_device)         # 5️⃣ restore flow to GPU (for log_prob)
                 # ------------------------------------------
 
 
                 # log_probs as before (this one is safe: we .to(eval_device) first)
+                
                 batch_log_probs = model.log_prob(
                     inputs=y.to(eval_device),
-                    context=cx
+                    context=ctx_gpu
                 ).cpu()
                 
                 generated.append(batch_samples)
@@ -342,7 +351,7 @@ def evaluate(
             
             plt.tight_layout()
             plt.savefig(f"{log_dir}/evaluation_setup_{i+1}.pdf", bbox_inches='tight')
-            plt.show()
+            # plt.show()
 
     # ✅ 计算所有测试集setup的平均误差
     print(f"\n📊 Computing errors for all {len(test_unique_setups)} test setups...")
@@ -369,6 +378,7 @@ def evaluate(
                 # cx = x_setup[start : start + batch_size].to(eval_device)
                 # batch_samples = model.sample(samples_per_cond, context=cx).cpu()
                 cx = x_setup[start : start + batch_size].to(eval_device)
+                ctx_gpu = encoder(cx)  # encode context
                 # same GPU‐sampling hack as above
                 # B = cx.size(0)
                 # z = torch.randn(samples_per_cond, B, 1, device=eval_device)
@@ -378,11 +388,11 @@ def evaluate(
                 # x_flat, _ = model._transform.inverse(z_flat, context=ctx_rep)
                 # batch_samples = x_flat.view(samples_per_cond, B, -1).cpu()                
                 # -------- device-safe CPU sampling --------
-                cx_cpu    = cx.cpu()          # 1️⃣ move context to CPU
+                ctx_cpu    = ctx_gpu.detach().cpu()          # 1️⃣ move context to CPU
                 model_cpu = model.to("cpu")   # 2️⃣ temporarily move the flow
 
                 batch_samples = (
-                    model_cpu.sample(samples_per_cond, context=cx_cpu)  # 3️⃣ sample on CPU
+                    model_cpu.sample(samples_per_cond, context=ctx_cpu)  # 3️⃣ sample on CPU
                             .to(eval_device)                           # 4️⃣ move result back
                 )
 
@@ -411,6 +421,8 @@ def evaluate(
                 'n_samples': len(x_setup)
             })
     
+    
+    error_csv_path = os.path.join(log_dir, "setup_errors.csv")
     # 计算平均误差
     if all_setup_errors:
         mean_error = np.mean(all_setup_errors)
@@ -471,14 +483,28 @@ def main() -> None:
     parser.add_argument("--test_ratio", type=float, default=0.2, help="Fraction of data held out for testing")
     parser.add_argument("--samples_per_cond", type=int, default=100, help="Samples per test condition during evaluation")
     parser.add_argument("--eval_subset", type=int, default=10000, help="Random subset of test rows to evaluate (None = all)")
+    parser.add_argument("--emb_dim", type=int, default=32, help="Dimensionality of context embeddings")
+    parser.add_argument("--dropout_probability", type=float, default=0.2, help="Dropout probability for the model")    
+    # parser.add_argument("--num_mixture_components", type=int, default=3, help="Number of mixture components in the base distribution")
+    
+    parser.add_argument(
+        "--num_mixture_components",
+        type=int,
+        nargs='+',
+        default=[3],
+        help="Number of mixture components in the base distribution"
+    )
     args = parser.parse_args()
 
     # prepare the grid of hyperparameters
     from itertools import product
-    grid = list(product(args.lr, args.hidden_features, args.num_layers, args.num_bins))
+    grid = list(product(args.lr, args.hidden_features, args.num_layers, args.num_bins, args.num_mixture_components))
     results = []
 
-    for lr, hf, nl, nb in grid:
+    for lr, hf, nl, nb, nmc in grid:
+        
+        run_dir = os.path.join(log_dir, f"lr{lr}_hf{hf}_nl{nl}_nb{nb}")
+        os.makedirs(run_dir, exist_ok=True)
         print(f"\n🔧 Running with lr={lr}, hidden_features={hf}, num_layers={nl}, num_bins={nb}")
 
         # ——— Load + split ———
@@ -504,20 +530,23 @@ def main() -> None:
         test_loader  = DataLoader(TensorDataset(x_test,  y_test),  test_batch_size, shuffle=False)
 
         # Build + metadata
-        flow, model_cfg = build_nfs_model(
+        encoder, flow, model_cfg = build_nfs_model(
             context_features=x.shape[1],
             hidden_features=hf,
             num_layers=nl,
-            num_bins=nb
+            num_bins=nb,
+            emb_dim=args.emb_dim,
+            dropout_probability=args.dropout_probability,
+            num_mixture_components=nmc
         )
         training_cfg = {"epochs": args.epochs, "learning_rate": lr, "batch_size": batch_size}
         data_cfg = {"total_samples": len(x), "train_samples": len(x_train), "test_samples": len(x_test)}
-        save_metadata(log_dir, model_cfg, training_cfg, data_cfg)
+        save_metadata(run_dir, model_cfg, training_cfg, data_cfg)
 
         # Train + evaluate
-        tr_res = train(flow, train_loader, test_loader, epochs=args.epochs, lr=lr)
-        flow.load_state_dict(torch.load(f"{log_dir}/trained_flow.pt", map_location=device))
-        errors = evaluate(flow, x_test, y_test, samples_per_cond=args.samples_per_cond)
+        tr_res = train(encoder, flow, train_loader, test_loader, epochs=args.epochs, lr=lr, log_dir=run_dir)
+        flow.load_state_dict(torch.load(f"{run_dir}/trained_flow.pt", map_location=device))
+        errors = evaluate(encoder, flow, x_test, y_test, samples_per_cond=args.samples_per_cond, log_dir=run_dir)
 
         # record summary
         results.append({

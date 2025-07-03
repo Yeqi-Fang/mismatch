@@ -1,5 +1,5 @@
 {
-  "timestamp": "2025-07-02T09:55:53.819111",
+  "timestamp": "2025-07-02T11:30:31.989661",
   "device": "cuda",
   "model_config": {
     "model_type": "MaskedPiecewiseRationalQuadraticAutoregressiveTransform",
@@ -7,9 +7,9 @@
     "flow_features": 1,
     "hidden_features": 16,
     "num_layers": 2,
-    "num_bins": 8,
+    "num_bins": 15,
     "base_distribution": "MADEMoG",
-    "total_parameters": 8287,
+    "total_parameters": 9001,
     "num_mixture_components": 3
   },
   "training_config": {

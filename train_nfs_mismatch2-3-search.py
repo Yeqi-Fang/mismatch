@@ -90,7 +90,7 @@ def _init_identity(transform):
             torch.nn.init.xavier_uniform_(module.weight)
 
 def build_nfs_model(context_features, flow_features=1, hidden_features=16,
-                    num_layers=3, num_bins=15, num_mixture_components: int = 3):
+                    num_layers=3, num_bins=15, num_mixture_components: int = 3, droupout_probability=0.2) -> Tuple[Flow, dict]:
     transforms = []
     for _ in range(num_layers):
         # spline block
@@ -121,6 +121,7 @@ def build_nfs_model(context_features, flow_features=1, hidden_features=16,
         hidden_features=hidden_features,
         context_features=context_features,
         num_mixture_components=num_mixture_components,
+        dropout_probability=droupout_probability,
     )
     
     flow = Flow(CompositeTransform(transforms), base_dist).float()
@@ -195,7 +196,7 @@ def train(model: Flow, train_loader: DataLoader, test_loader: DataLoader = None,
     plt.plot(epochs_range, train_losses, 'b-', label='Training Loss', linewidth=2)
     if test_losses:
         plt.plot(epochs_range, test_losses, 'r-', label='Test Loss', linewidth=2)
-    
+    plt.yscale('log')
     plt.xlabel('Epoch')
     plt.ylabel('Negative Log-Likelihood')
     plt.title('Training and Test Loss Over Time')
@@ -468,6 +469,7 @@ def main() -> None:
     parser.add_argument("--test_ratio", type=float, default=0.2, help="Fraction of data held out for testing")
     parser.add_argument("--samples_per_cond", type=int, default=100, help="Samples per test condition during evaluation")
     parser.add_argument("--eval_subset", type=int, default=10000, help="Random subset of test rows to evaluate (None = all)")
+    parser.add_argument("--dropout_probability", type=float, default=0.2, help="Dropout probability for the model")
     args = parser.parse_args()
 
     # prepare the grid of hyperparameters
@@ -505,7 +507,8 @@ def main() -> None:
             context_features=x.shape[1],
             hidden_features=hf,
             num_layers=nl,
-            num_bins=nb
+            num_bins=nb,
+            droupout_probability=args.dropout_probability,
         )
         training_cfg = {"epochs": args.epochs, "learning_rate": lr, "batch_size": batch_size}
         data_cfg = {"total_samples": len(x), "train_samples": len(x_train), "test_samples": len(x_test)}
