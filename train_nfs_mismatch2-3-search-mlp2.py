@@ -155,6 +155,7 @@ def train(encoder: ContextEncoder, model: Flow, train_loader: DataLoader, test_l
         lr=lr,
         weight_decay=1e-4
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
     # Track losses
     train_losses = []
     test_losses = []
@@ -168,10 +169,13 @@ def train(encoder: ContextEncoder, model: Flow, train_loader: DataLoader, test_l
         for cx, y in train_loader:
             cx, y = cx.to(device, non_blocking=True), y.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            ctx = encoder(cx)
-            loss = -model.log_prob(inputs=y, context=ctx).mean()
-            loss.backward()
-            opt.step()
+            with torch.cuda.amp.autocast(enabled=USE_AMP):
+                ctx = encoder(cx)
+                loss = -model.log_prob(inputs=y, context=ctx).mean()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            
             ep_train_loss += loss.item()
         ep_train_loss /= len(train_loader)
         train_losses.append(ep_train_loss)
@@ -181,7 +185,7 @@ def train(encoder: ContextEncoder, model: Flow, train_loader: DataLoader, test_l
         if test_loader is not None:
             model.eval()
             ep_test_loss = 0.0
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=USE_AMP):
                 for cx, y in test_loader:
                     cx, y = cx.to(device, non_blocking=True), y.to(device, non_blocking=True)
                     ctx = encoder(cx)
@@ -279,7 +283,7 @@ def evaluate(
         generated = []
         log_probs = []
         # model_cpu = model.to("cpu")   # 2️⃣ temporarily move the flow
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=USE_AMP):
             for start in range(0, len(x_setup), batch_size):
                 cx = x_setup[start : start + batch_size].to(eval_device)
                 y = y_setup[start : start + batch_size]
@@ -326,7 +330,7 @@ def evaluate(
             plt.figure(figsize=(15, 5))
             
             plt.subplot(1, 3, 1)
-            plt.hist(y_emp, bins=10, label="Empirical", alpha=0.5, density=True)
+            sns.kdeplot(y_emp, label="Empirical", fill=True, alpha=0.5)
             sns.kdeplot(y_gen, label="Generated", fill=True, alpha=0.5)
             plt.title(f"Setup {i+1} Distribution Overlap")
             plt.xlim([-0.1, 1.1])
@@ -375,7 +379,7 @@ def evaluate(
         
         # 生成预测样本并计算均值
         generated_samples = []
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=USE_AMP):
             for start in range(0, len(x_setup), batch_size):
                 # cx = x_setup[start : start + batch_size].to(eval_device)
                 # batch_samples = model.sample(samples_per_cond, context=cx).cpu()
@@ -541,6 +545,10 @@ def main() -> None:
             dropout_probability=args.dropout_probability,
             num_mixture_components=nmc
         )
+        if USE_COMPILE:
+            encoder = torch.compile(encoder)
+            flow    = torch.compile(flow)
+            
         training_cfg = {"epochs": args.epochs, "learning_rate": lr, "batch_size": batch_size}
         data_cfg = {"total_samples": len(x), "train_samples": len(x_train), "test_samples": len(x_test)}
         save_metadata(run_dir, model_cfg, training_cfg, data_cfg)
